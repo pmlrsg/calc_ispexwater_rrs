@@ -1,0 +1,3 @@
+[submodule "ispex2"]
+	path = ispex2
+	url = https://github.com/burggraaff/ispex2.git
