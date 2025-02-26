@@ -42,7 +42,8 @@ class Ispeximage(object):
         self.wavelengths_split_Qm = None    #
         self.Qp_RGBG = None                 # RGBG values for each pixel in the Qx image after previous processing steps
         self.Qm_RGBG = None                 #
-        # TODO: replace the following with lookup based on phone model
+        self.Qp_stacked_RGB_mean = None     # Qx RGB values averaged along the slit dimension
+        self.Qm_stacked_RGB_mean = None     #
         try:
             self.wl_calib_qp = np.load(os.path.join("cameras", self.camera, "wavelength_calibration_Qp.npy"))
             self.wl_calib_qm = np.load(os.path.join("cameras", self.camera, "wavelength_calibration_Qm.npy"))
@@ -108,15 +109,9 @@ class Ispeximage(object):
         lambdarange, Qp_RGBG = self.interpolate_multi(self.wavelengths_split_Qp, self.RGBG_Qp_smoothed)
         lambdarange, Qm_RGBG = self.interpolate_multi(self.wavelengths_split_Qm, self.RGBG_Qm_smoothed)
         
-        # stack the RGBG into a WL,R,G,B array
+        # stack the RGBG into a WL,R,G,B array (4xN) 
         self.Qp_stacked_RGB = self.stack(lambdarange, Qp_RGBG)  # RGB radiance in arbitrary units
         self.Qm_stacked_RGB = self.stack(lambdarange, Qm_RGBG)  # RGB radiance in arbitrary units
-
-        # TODO: Average along the slit dimension, respecting the smile effect, to get a single Qm and Qp spectrum per RGB channel.
-
-
-
-
 
         if self.output_plots:
             self.plot_bounding_boxes()
@@ -269,7 +264,7 @@ class Ispeximage(object):
         Outputs [WL, R, G, B] array
         """
         stacked = interpolated.mean(axis=2)
-        stacked = np.roll(stacked, 1, axis=0)  # move to make space for wavelengths
+        stacked = np.roll(stacked, 1, axis=0)      # move to make space for wavelengths
         stacked[2] = (stacked[0] + stacked[2])/2.  # G becomes mean of G
         stacked[0] = wavelengths  # put wavelengths into array
         return stacked
