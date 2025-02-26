@@ -1,3 +1,6 @@
 [submodule "ispex2"]
 	path = ispex2
 	url = https://github.com/burggraaff/ispex2.git
+[submodule "spectacle"]
+	path = spectacle
+	url = https://github.com/monocle-h2020/camera_calibration.git
