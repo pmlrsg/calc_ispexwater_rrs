@@ -1,6 +1,9 @@
 # image outputs
 *.png
 
+# image inputs
+*.DNG
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
