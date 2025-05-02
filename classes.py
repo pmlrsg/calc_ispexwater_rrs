@@ -430,15 +430,25 @@ class Ispeximage(object):
             self.check_areas = False
             raise
 
+    def imshowthis(self, image, label='tmp.png'):
+        if image.ndim == 3:
+            # normalise image to 0-1 range
+            image = (image - np.min(image)) / (np.max(image) - np.min(image))
+        plt.clf()
+        plt.imshow(image)
+        plt.colorbar()
+        plt.savefig(os.path.join('.', label))
+        plt.close()
+
     def background_solver(self):
         """
         Solve for the background noise level by interpolating across the RGB image layers.
         """
         # find image index halfway between slit and projected area
         try:
-            end_of_slit_y = np.argwhere(self.slit_area_mask == 1)[-1][-1]
-            start_of_proj_y = np.argwhere(self.projected_area_mask == 1)[-1][0]
-            end_of_proj_y = np.argwhere(self.projected_area_mask == 1)[-1][-1]
+            end_of_slit_y = np.argwhere(self.slit_area_mask > 0)[-1][-1]
+            start_of_proj_y = np.argwhere(self.projected_area_mask > 0)[-1][0]
+            end_of_proj_y = np.argwhere(self.projected_area_mask > 0)[-1][-1]
             assert end_of_slit_y < start_of_proj_y
             assert end_of_proj_y > start_of_proj_y
             assert end_of_proj_y < self.img_raw_RGB.shape[1]
@@ -446,10 +456,13 @@ class Ispeximage(object):
         except AssertionError:
             raise(Exception("Error finding background area (areas are invalid)"))
 
+        # initialise the output background image
         self.background = np.zeros_like(self.img_raw_RGB)
+
+        # create a slice of the image to be used for background noise level interpolation
         background_slice = self.img_raw_RGB.copy()
-        # mask the slit area
-        background_slice[:, :background_slice_start, :] = np.nan
+        # self.imshowthis(background_slice, label=f'background_slice_input_RGB.png')
+
         # # mask the projected areas with 20% buffer
         # mask the projected area as one large symmetrical rectangle based on buffered projection bounds
         # define symmetrical bounds for the projected area
@@ -464,10 +477,19 @@ class Ispeximage(object):
         except AssertionError:
             raise(Exception("Error finding projected areas (buffered area bounds exceed image bounds)"))
         background_slice[slice_x_start:slice_x_end, slice_y_start:slice_y_end, :] = np.nan
+        # mask out the slit area
+        background_slice[:, :background_slice_start, :] = np.nan
+
+        # self.imshowthis(background_slice[...,0], label=f'background_slice_masked_R.png')
+        # self.imshowthis(background_slice[...,1], label=f'background_slice_masked_G.png')
+        # self.imshowthis(background_slice[...,2], label=f'background_slice_masked_B.png')
+
         uncertainty_background_2sigma = {}
 
         for i, layername in enumerate(['R', 'G', 'B']):
             layer = background_slice[...,i]
+            self.imshowthis(background_slice, label=f'background_slice_{layername}.png')
+
             if np.isnan(layer).all():
                 continue
 
@@ -489,7 +511,7 @@ class Ispeximage(object):
                                                                      np.arange(layer.shape[1]))).T.reshape(-1, 2))
             layer_interpolated = background_pred.reshape(layer.shape)
 
-            # calculate the background correction and uncertainty over the qm and qp slice areas
+            # calculate the background correction and uncertainty over the qm and qp slice areas (low estimate as includes low signal areas)
             layer_interp_qm = layer_interpolated[int(self.start_qm):int(self.end_qm), int(self.top_qx):int(self.bottom_qx)]
             layer_interp_qp = layer_interpolated[int(self.start_qp):int(self.end_qp), int(self.top_qx):int(self.bottom_qx)]
             layer_original_qm = self.img_raw_RGB[int(self.start_qm):int(self.end_qm), int(self.top_qx):int(self.bottom_qx), i]
@@ -497,10 +519,13 @@ class Ispeximage(object):
             layer_interp_qx = np.concat([layer_interp_qm, layer_interp_qp], axis=0)
             layer_original_qx = np.concat([layer_original_qm, layer_original_qp], axis=0)
             uncertainty_background_2sigma[layername] = np.nanstd(layer_interp_qx - layer_original_qx) * 2.0
-            
+            self.log.info(f"Uncertainty background 2 sigma for layer {i}: {uncertainty_background_2sigma[layername]}")
+
             # Replace the NaN values in the original background_slice with the interpolated values
             layer[np.isnan(layer)] = layer_interpolated[np.isnan(layer)]
             self.background[...,i] = layer
+
+            self.imshowthis(layer, label=f"background_interp_{layername}.png")
 
 
     def plot_bounding_areas(self):
@@ -536,16 +561,21 @@ class Ispeximage(object):
         Plot the background correction for each layer
         """
         for i, layername in enumerate(['R', 'G', 'B']):
-            relative_bg_correction = 100.0*(self.img_raw_RGB[...,i]-self.background[...,i])/self.img_raw_RGB[...,i]
-            relative_bg_correction[self.slit_area_mask==1] = np.nan
-            plt.imshow(relative_bg_correction, cmap='coolwarm', vmin=0)
+            signal = self.img_raw_RGB[...,i]
+            peak_signal = np.nanmax(signal[self.projected_area_mask>0])
+            relative_bg_correction = self.background[..., i]
+            relative_bg_correction[self.projected_area_mask > 0] /= peak_signal
+            relative_bg_correction[self.projected_area_mask == 0] = np.nan
+            signal[self.projected_area_mask>0] = np.nan
+
+            rel_bg_corr_mean = 100.0 * np.nanmean(relative_bg_correction)
+            rel_bg_corr_std =  100.0 * np.nanstd(relative_bg_correction)
+            plt.imshow(relative_bg_correction, cmap='coolwarm', vmin=0, vmax = rel_bg_corr_mean + 2*rel_bg_corr_std)
             plt.colorbar()
-            rel_bg_corr_mean = np.nanmean(relative_bg_correction[self.start_qp:self.end_qm, self.top_qx:self.bottom_qx])
-            rel_bg_corr_std = np.nanstd(relative_bg_correction[self.start_qp:self.end_qm, self.top_qx:self.bottom_qx])
+            plt.imshow(signal, cmap='grey', vmin=0)
+            plt.contour(self.projected_area_mask>0, levels=[0.1], colors='black', linewidths=0.5)
             plt.text(s=f"{layername} background correction\n {rel_bg_corr_mean:2.2f} +/- {rel_bg_corr_std:2.2f} %",
-                    x=self.background.shape[1]*0.05,
-                    y=self.background.shape[0]*0.95,
-                    color="black")
+                    x=self.background.shape[1]*0.05, y=self.background.shape[0]*0.95, color="white")
             plt.savefig(os.path.join(self.save_path, f"{self.label}_background_{layername}.png"), bbox_inches="tight")
             plt.close()
 
