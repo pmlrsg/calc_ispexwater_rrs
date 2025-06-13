@@ -56,6 +56,9 @@ class Ispeximage(object):
         self.img_raw_RGBG = None            #  raw image demosaicked to RGBG space
         self.img_raw_RGB = None             #  raw image mapped to RGB (0-1 scale), for visualisation purposes only
 
+        # exif metadata
+        # TODO get metadata
+
         # Quality Control                   
         self.check_areas = False            #  If False, the slit and/or projected areas could not be found
 
@@ -100,10 +103,11 @@ class Ispeximage(object):
 
         self.process()
 
-        if self.output_plots:
-            self.plot_bounding_areas()
-            self.plot_background_correction()
-            #self.plot_spectra()
+        # if self.output_plots:
+            # self.plot_bounding_areas()
+            # self.plot_background_correction()
+            # self.plot_spectra()
+            # self.plot_fluorescent_lines()
 
 
     def process(self):
@@ -130,7 +134,7 @@ class Ispeximage(object):
             self.img_post = img.postprocess()
 
         # Ensure images always have the same orientation
-        # Rotate if if the vertical dimension is longer than the horizontal
+        # Rotate if the vertical dimension is longer than the horizontal
         if self.img_raw.shape[0] > self.img_raw.shape[1]:
             self.img_raw = np.rot90(self.img_raw)
         if self.bayer_map.shape[0] > self.bayer_map.shape[1]:
@@ -138,31 +142,37 @@ class Ispeximage(object):
         if self.img_post.shape[0] > self.img_post.shape[1]:
             self.img_post = np.rot90(self.img_post)
 
-
         # Demosaick RAW image to RGBG format using the bayer pattern
         self.img_raw_RGBG = self.demosaick(self.bayer_map, self.img_raw)
         # combine G channels
         self.img_raw_RGB = self._raw2RGB(normalise=False)
 
+        self.imshowthis(self.img_raw_RGB, label='img_raw_RGB.png')
+
         self.log.info(f"Identify slit and projected image areas")
         self.find_areas()
-        # self.plot_bounding_boxes()
+        if not self.check_areas:
+            self.log.error("Could not process image (projected areas are invalid)")
+            raise(Exception("Could not process image (projected areas are invalid)"))
+
+        self.plot_bounding_areas()
 
         # Background correction
         self.log.info(f"Interpolate background brightness")
         # FIXME: do this on RGB instead of RGBG to save time
         self.background_solver()
-        # self.plot_background_correction()
+        self.plot_background_correction()
         self.img_bg_corrected = self.img_raw_RGB - self.background
+
 
         if self.type == 'fluorescent_lamp_cal':
             self.process_fluorescent_lamp_calibration()
 
         elif self.type == 'observation':
-            self.process_single_observation()
+            #self.process_single_observation()
+            self.log.info("stop here for now")
         else:
             self.log.error(f"Invalid record type: {self.type}")
-
 
     def process_single_observation(self):
         """
@@ -170,6 +180,7 @@ class Ispeximage(object):
         - calculate the wavelength for each pixel in the image
         - compute radiances
         """
+        self.log = logging.getLogger('ispex.image.process.single')
         self.log.info(f"Processing iSPEX 2 image")
         # OLD CODE
         # raw and demosaicked image have the short axis (along-slit) mirrored for some reason. x-y order also swapped.
@@ -249,6 +260,7 @@ class Ispeximage(object):
         These images should be obtained in a dark environment with a fluorescent lamp
         as the only light source illuminating a spectrally neutral panel diffuse panel.
         """
+        self.log = logging.getLogger('ispex.image.process.cal')
         self.log.info(f"Processing fluorescent lamp calibration image")
 
         # Convert the RGB image to summed intensity
@@ -342,7 +354,8 @@ class Ispeximage(object):
         """
         Find the slit and projected areas in the image
         """
-        cut_tolerance = 0.05  # % of max value in projected areas is used to slice the image
+        self.log = logging.getLogger('ispex.image.process.find_areas')
+        cut_tolerance = 0.05  # fraction of max value in projected areas used to slice the image
 
         img_raw_sum = np.nansum(self.img_raw_RGB, axis=2)
         img_raw_sum_1d = img_raw_sum.flatten().reshape(-1, 1)
@@ -352,45 +365,64 @@ class Ispeximage(object):
         kmeans = KMeans(n_clusters=2, random_state=0).fit(img_raw_sum_1d)
         self.slit_area_mask = kmeans.labels_.reshape(img_raw_sum.shape)
 
-        # Cluster the remainder of the image again to find te projected area
-        # Ignore slit area by cutting the image with a 20% buffer
-        buffer_width = int(np.floor(np.min(img_raw_sum.shape)* 0.2))  # 20% buffer of image width
-        max_index = np.max(np.where(self.slit_area_mask == 1)[1])
-        cut_index = max_index + buffer_width
-
+        # Cluster the remainder of the image again to find the projected area
+        # Ignore slit area by cutting the image with a 20% buffer or no less than half the image length
+        buffer_width = int(img_raw_sum.shape[1] * 0.2)  # 20% buffer of image length
+        max_index = np.max(np.where(self.slit_area_mask == 1)[1]) + buffer_width
+        cut_index = int(np.max([max_index, img_raw_sum.shape[1]*0.5]))
         img_raw_sum_bottom_half = img_raw_sum[:, cut_index:]
         img_raw_sum_bottom_half_1d = img_raw_sum_bottom_half.flatten().reshape(-1, 1)
-        # the number of clusters to expect in the project image is not known
-        # 2+ clusters are required to avoid losing information in the fading edges of the spectrum.
+
+        # the number of bright clusters to expect in the projected image is not known.
+        # 2+ clusters are required to separate the projected area from the background.
+        # More clusters can help to avoid losing information in the fading edges of the spectrum.
         # Too many clusters risk capturing reflections and stray light.
-        for n_clusters in range(7, 3, -1):
+        # Iterate from 7 to 2 clusters, stopping when a valid projected area is found.
+        for n_clusters in range(7, 1, -1):
+            overexposed = False
             kmeans = KMeans(n_clusters=n_clusters, random_state=0).fit(img_raw_sum_bottom_half_1d)
             labels = kmeans.labels_.reshape(img_raw_sum_bottom_half.shape)
             self.projected_area_mask = np.zeros_like(self.slit_area_mask)
             self.projected_area_mask[:, cut_index:] = labels
 
+            self.imshowthis(self.projected_area_mask, label=f'projected_area_mask_{n_clusters}.png')
+
             # aggregate the image along the slit dimension to find the two projected sections
             img_raw_sum_along_slit = img_raw_sum.copy()
             img_raw_sum_along_slit[self.projected_area_mask == 0] = 0
+            img_raw_sum_along_slit[self.projected_area_mask > 0] = 1
             img_raw_sum_along_slit = np.nansum(img_raw_sum_along_slit, axis=1)
             # cumulative sum along the slit dimension
             img_raw_sum_along_slit_cumsum = np.cumsum(img_raw_sum_along_slit)
+
+            plt.plot(img_raw_sum_along_slit_cumsum)
+            plt.savefig(os.path.join(self.save_path, f'img_raw_sum_along_slit_cumsum_{n_clusters}.png'))
+            plt.close()
 
             # top and bottom edges of the projected area k-means cluster 
             self.top_qx = np.argwhere(np.nansum(self.projected_area_mask, axis = 0) > 0)[0][0]
             self.bottom_qx = np.argwhere(np.nansum(self.projected_area_mask, axis = 0) > 0)[-1][0]
             
-            if (self.top_qx <= cut_index * cut_tolerance) or \
-                    (self.bottom_qx >= img_raw_sum.shape[1] * (1.0 - cut_tolerance)):
-                self.log.info(f"Lowering sensitivity from {n_clusters} to {n_clusters - 1} clusters") 
-                continue
+            # First quality test
+            if (self.top_qx <= cut_index + cut_index * cut_tolerance) or \
+                    (self.bottom_qx >= img_raw_sum.shape[1] - (img_raw_sum.shape[1] * cut_tolerance)):
+                overexposed = True
 
+            # Second quality test
             # Count the number of pixels masked by the projected_area_mask
             masked_pixel_count = np.sum(self.projected_area_mask > 0)
             # If the number of pixels is too large, try again with fewer clusters
             if masked_pixel_count > 0.5 * img_raw_sum_bottom_half.shape[0] * img_raw_sum_bottom_half.shape[1]:
+                overexposed = True
+
+            if overexposed and n_clusters == 2:
+                breakpoint()
+                self.log.error("Image is overexposed")
+                self.check_areas = False
+                return
+            elif overexposed:
                 self.log.info(f"Lowering sensitivity from {n_clusters} to {n_clusters - 1} clusters") 
-                continue
+            continue
 
         try: 
             # Find edges along the slit dimension
@@ -526,7 +558,6 @@ class Ispeximage(object):
             self.background[...,i] = layer
 
             self.imshowthis(layer, label=f"background_interp_{layername}.png")
-
 
     def plot_bounding_areas(self):
         """
@@ -904,7 +935,6 @@ class Ispeximage(object):
                                         self.constants.fluorescent_lines,
                                         self.constants.degree_of_wavelength_fit)
         return coeffarr
-
 
     def resolution(self, data_RGB, dispersion):
         slit = data_RGB[:,:data_RGB.shape[1]//2, 2] # Get the left half of the G image
