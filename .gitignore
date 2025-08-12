@@ -1,6 +1,9 @@
 # image outputs
 *.png
 
+# image metadata
+.json
+
 # image inputs
 *.DNG
 
