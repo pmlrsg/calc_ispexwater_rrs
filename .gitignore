@@ -2,7 +2,7 @@
 *.png
 
 # image metadata
-.json
+*.json
 
 # image inputs
 *.DNG
