@@ -7,6 +7,11 @@ from scipy.ndimage import gaussian_filter as gaussMd
 from sklearn.cluster import KMeans
 from sklearn.ensemble import HistGradientBoostingRegressor
 import logging
+import json
+import glob
+import re
+import datetime
+
 
 class Constants(object):
     """
@@ -26,9 +31,10 @@ class Ispeximage(object):
     The class contains methods to process the image file and save the processed data.
     """
     def __init__(self,
-                 dng_path=None,
-                 save_path=None,
-                 camera='apple_iphone_mini_13',
+                 dng_path,
+                 save_path_root = 'example_outputs',
+                 calibration_set = None,
+                 calibration_root = 'cameras',
                  output_plots=False,
                  type='observation'):
         """
@@ -36,8 +42,9 @@ class Ispeximage(object):
           camera profile, and output directory (if producing plots).
 
         param dng_path: str, path to the dng image file
-        param save_path: str, path to the output directory
-        param camera: str, name of camera profile
+        param save_path_root: str, path to the output directory to store plots and data
+        param calibration_set: str, path to the preferred calibration set (optional)
+        param calibration_root: str, root directory for calibration files
         param output_plots: bool, whether to produce plots
         param type: str, one of ['observation', 'fluorescent_lamp_cal']
         """
@@ -45,19 +52,52 @@ class Ispeximage(object):
         self.constants = Constants()
 
         self.dng_path = dng_path            #  source RAW image file
-        self.label = os.path.basename(dng_path).split(".")[0]
-        self.save_path = save_path          #  output directory for plots, data files
+        self.label = os.path.basename(dng_path).split(".")[0]    # prefix for outputs
+        self.save_path = os.path.join(save_path_root)            #  output directory for plots, data files, should include 'Set' label
         self.output_plots = output_plots    #  whether to produce plots
         self.type = type                    #  type of image, used to determine processing steps
 
         self.img_raw = None                 #  raw image data
         self.img_post = None                #  raw image data mapped to RGB, for visualisation purposes only
-        self.camera = camera                #  camera model, used to load calibration profile
         self.img_raw_RGBG = None            #  raw image demosaicked to RGBG space
         self.img_raw_RGB = None             #  raw image mapped to RGB (0-1 scale), for visualisation purposes only
 
-        # exif metadata
-        # TODO get metadata
+        self.datetimeuuid, regexmatch = self.get_datetime_uuid_exposure()    # datetime_uuid_exposure from the file name
+        self.obstype = regexmatch.groupdict()['obstype']                 # 'C', 'S', or 'W' for Card, Sky, Water
+        self.exposure_sequence = regexmatch.groupdict()['exposure_seq']  # E0, E1, E2, E3, or E4  also from metadata.exposure_index
+        self.datestr = regexmatch.groupdict()['datestr']                 # Date in YYYYMMDD format
+        self.timestr = regexmatch.groupdict()['timestr']                 # Time in HHMM format
+        self.uuid = regexmatch.groupdict()['uuid']                       # first 4 digits of the UUID, used to prevent duplication
+
+        # read metadata from json
+        self.metadata_path = self.dng_path.replace('.DNG', '.json').replace('IMG_', 'META_')
+        if not os.path.exists(self.metadata_path):
+            raise IOError(f"Metadata file not found: {self.metadata_path}")
+        metadata_json = json.load(open(self.metadata_path, 'r'))
+
+        self.device_model = metadata_json.get('device_model', None)
+        self.dev_model_sanitised = self.device_model.replace(' ', '_').replace(',','_')
+
+        self.iso = metadata_json.get('iso', None)
+        self.min_iso = metadata_json.get('min_iso', None)
+        self.max_iso = metadata_json.get('max_iso', None)
+        self.lens_position = metadata_json.get('lens_position', None)
+
+        self.latitude = metadata_json.get('latitude', None)
+        self.longitude = metadata_json.get('longitude', None)
+        self.elevation = metadata_json.get('elevation', None)
+        self.azimuth = metadata_json.get('azimuth', None)
+
+        self.time_utc = metadata_json.get('time_utc', None)
+
+        self.exposure_index = metadata_json.get('exposure_index', None)
+        self.exposure_mode = metadata_json.get('exposure_mode', None)
+        self.exposure_time = metadata_json.get('exposure_time', None)
+        self.exposure_duration = metadata_json.get('exposure_duration', None)
+        self.min_exposure_duration = metadata_json.get('min_exposure_duration', None)
+        self.max_exposure_duration = metadata_json.get('max_exposure_duration', None)
+        self.exposure_target_bias = metadata_json.get('exposure_target_bias', None)
+        self.exposure_target_offset = metadata_json.get('exposure_target_offset', None)
 
         # Quality Control                   
         self.check_areas = False            #  If False, the slit and/or projected areas could not be found
@@ -93,22 +133,77 @@ class Ispeximage(object):
         self.Qp_stacked_RGB_mean = None     # Qx RGB values averaged along the slit dimension
         self.Qm_stacked_RGB_mean = None     #
 
-        try:
-            self.wl_calib_qp = np.load(os.path.join("cameras", self.camera, "wavelength_calibration_Qp.npy"))
-            self.wl_calib_qm = np.load(os.path.join("cameras", self.camera, "wavelength_calibration_Qm.npy"))
-        except IOError:
+        # determine where calibration files should be saved (if mode is calibration) or retrieved
+        self.calibration_set = calibration_set                 # Path to the preferred calibration file set, if provided
+        self.calibration_root = calibration_root               # Root directory for calibration files
+        if self.calibration_set is None:
+            self.calibration_set = self.find_latest_calibration()   # Find latest calibration set by date for this phone model.
+        if self.type == 'fluorescent_lamp_cal':
+            # calibration coefficients will be stored later
             self.wl_calib_qp = None
             self.wl_calib_qm = None
-            raise
+        elif self.type == 'observation' and self.calibration_set is not None:
+            # load wavelength calibration coefficients from the latest calibration set
+            # FIXME: there may be multiple calibration sets in the folder - need a way to select the best one e.g. by looking at dispersion..
+            # workaround is to make a folder with a later date label and copy just one set into it.  
+            self.wl_calib_qp = np.load(os.path.join(self.calibration_set, "wavelength_calibration_Qp.npy"))
+            self.wl_calib_qm = np.load(os.path.join(self.calibration_set, "wavelength_calibration_Qm.npy"))
+        else:
+            raise IOError(f"Required calibration files not found")
 
-        self.process()
+    def get_datetime_uuid_exposure(self):
+        """
+        Extract the datetime and UUID from the file name.
+        Returns:
+            str datetimeuuid: string representing the date_time_uuid_exposure. 
+        """ 
+        pattern = re.compile(r"IMG_(?P<datestr>\d{8})_(?P<timestr>\d{4})_(?P<uuid>\w{4})_(?P<obstype>\w{1})_(?P<exposure_seq>\w{2}).DNG")
+        match = pattern.match(os.path.basename(self.dng_path))
+        if match is None:
+            raise ValueError(f"Filename {self.dng_path} does not match expected pattern.")
+        datestr = match.groupdict()['datestr']  # Date in YYYYMMDD format
+        timestr = match.groupdict()['timestr']  # Time in HHMM format
+        uuid = match.groupdict()['uuid']        #  first 4 digits of the UUID, used to prevent duplication
+        exposure = match.groupdict()['exposure_seq']  # E0, E1, E2, E3, or E4
+        return f"{datestr}_{timestr}_{uuid}_{exposure}", match
+        
 
-        # if self.output_plots:
-            # self.plot_bounding_areas()
-            # self.plot_background_correction()
-            # self.plot_spectra()
-            # self.plot_fluorescent_lines()
+    def find_latest_calibration(self):
+        """
+        Return the latest calibration coefficients for the camera.
+        Generate a folder for cal files if the device is new to us.
+        """
+        cal_path = os.path.join(self.calibration_root, self.dev_model_sanitised)
+        if not os.path.exists(cal_path):
+            os.makedirs(cal_path)
 
+        # Find the latest calibration set (a folder possibly containing multiple calibration images with various exposures)
+        # Assuming calibration sets are named with a date format like 'YYYYMMDD_HHMM_UUID'
+        cal_sets = [folder for folder in glob.glob(os.path.join(cal_path, '*')) if os.path.isdir(folder)]
+        if not cal_sets:
+            self.log.info(f"No calibration sets found for {self.device_model} in {cal_path}.")
+            return None
+
+        pattern = re.compile(r"(?P<datestr>\d{8})_(?P<timestr>\d{4})_(?P<uuid>\d{4})")
+        caltimes = []
+        for cal_set in cal_sets:
+            match = pattern.match(os.path.basename(cal_set))
+            if match is None:
+                caltimes.append(-1)
+                continue
+            date = int(match.groupdict()['datestr'])  # Date in YYYYMMDD format
+            time = int(match.groupdict()['timestr'])  # Time in HHMM format
+            uuid = int(match.groupdict()['uuid'])     # UUID
+            caltimes.append(f"%Y%m%d%H%M")
+
+        latest_calibration_set_path = cal_sets[np.argmax(caltimes)][0]
+
+        if latest_calibration_set_path == -1:
+            if self.type == 'observation':
+                raise FileNotFoundError(f"No calibration sets found for {self.device_model} in {cal_path}. Unable to process iSPEX image.")
+            return None
+
+        return latest_calibration_set_path
 
     def process(self):
         """
@@ -123,7 +218,7 @@ class Ispeximage(object):
             try:
                 assert img.raw_type.name == "Flat"
             except AssertionError:
-                raise(f"Invalid raw type: {img.raw_type}. Expected RawType.Flat")
+                raise AssertionError(f"Invalid raw type: {img.raw_type}. Expected RawType.Flat")
 
             # obtain the raw image and bayer RGBG pixel mapping pattern
             self.img_raw = img.raw_image.astype(np.int16)  # was np.float64
@@ -147,7 +242,7 @@ class Ispeximage(object):
         # combine G channels
         self.img_raw_RGB = self._raw2RGB(normalise=False)
 
-        self.imshowthis(self.img_raw_RGB, label='img_raw_RGB.png')
+        # self.imshowthis(self.img_raw_RGB, label='img_raw_RGB.png')  # Debug only
 
         self.log.info(f"Identify slit and projected image areas")
         self.find_areas()
@@ -155,13 +250,10 @@ class Ispeximage(object):
             self.log.error("Could not process image (projected areas are invalid)")
             raise(Exception("Could not process image (projected areas are invalid)"))
 
-        self.plot_bounding_areas()
-
         # Background correction
         self.log.info(f"Interpolate background brightness")
         # FIXME: do this on RGB instead of RGBG to save time
         self.background_solver()
-        self.plot_background_correction()
         self.img_bg_corrected = self.img_raw_RGB - self.background
 
 
@@ -323,8 +415,11 @@ class Ispeximage(object):
         coefficients_qm, coefficients_fit_qm = self.fit_wavelength_coefficients(ym, wavelength_fits_qm)
         
         # Save the coefficients to file for use when processing other images
-        np.save(os.path.join(self.save_path, f"{self.label}_wavelength_calibration_Qm.npy"), coefficients_qm)
-        np.save(os.path.join(self.save_path, f"{self.label}_wavelength_calibration_Qp.npy"), coefficients_qp)
+        cal_save_path = os.path.join(self.calibration_root, self.dev_model_sanitised, self.datetimeuuid)
+        if not os.path.exists(cal_save_path):
+            os.makedirs(cal_save_path)
+        np.save(os.path.join(cal_save_path, f"{self.datetimeuuid}_{self.exposure_sequence}_wavelength_calibration_Qm.npy"), coefficients_qm)
+        np.save(os.path.join(cal_save_path, f"{self.datetimeuuid}_{self.exposure_sequence}_wavelength_calibration_Qp.npy"), coefficients_qp)
 
         # Convert the input image pixel values to wavelengths values using the coefficients
         def calculate_wavelengths(coeff, x, y):
@@ -336,8 +431,6 @@ class Ispeximage(object):
         wavelengths_qm = calculate_wavelengths(coefficients_qm, x, ym)
 
         if self.output_plots:
-            #self.plot_fluorescent_lines(yp, lines_qp, lines_fit_qp, qx='Qp')
-            #self.plot_fluorescent_lines(ym, lines_qm, lines_fit_qm, qx='Qm')
             self.plot_fluorescent_lines_double(qx_y_grids=[yp, ym],
                                             qx_line_positions=[lines_qp, lines_qm],
                                             qx_line_fits=[lines_fit_qp, lines_fit_qm],
@@ -385,7 +478,7 @@ class Ispeximage(object):
             self.projected_area_mask = np.zeros_like(self.slit_area_mask)
             self.projected_area_mask[:, cut_index:] = labels
 
-            self.imshowthis(self.projected_area_mask, label=f'projected_area_mask_{n_clusters}.png')
+            # self.imshowthis(self.projected_area_mask, label=f'projected_area_mask_{n_clusters}.png')  # debug only
 
             # aggregate the image along the slit dimension to find the two projected sections
             img_raw_sum_along_slit = img_raw_sum.copy()
@@ -395,9 +488,9 @@ class Ispeximage(object):
             # cumulative sum along the slit dimension
             img_raw_sum_along_slit_cumsum = np.cumsum(img_raw_sum_along_slit)
 
-            plt.plot(img_raw_sum_along_slit_cumsum)
-            plt.savefig(os.path.join(self.save_path, f'img_raw_sum_along_slit_cumsum_{n_clusters}.png'))
-            plt.close()
+            #plt.plot(img_raw_sum_along_slit_cumsum)
+            #plt.savefig(os.path.join(self.save_path, f'img_raw_sum_along_slit_cumsum_{n_clusters}.png'))
+            #plt.close()
 
             # top and bottom edges of the projected area k-means cluster 
             self.top_qx = np.argwhere(np.nansum(self.projected_area_mask, axis = 0) > 0)[0][0]
@@ -520,7 +613,7 @@ class Ispeximage(object):
 
         for i, layername in enumerate(['R', 'G', 'B']):
             layer = background_slice[...,i]
-            self.imshowthis(background_slice, label=f'background_slice_{layername}.png')
+            # self.imshowthis(background_slice, label=f'background_slice_{layername}.png')  # debug only
 
             if np.isnan(layer).all():
                 continue
@@ -557,7 +650,7 @@ class Ispeximage(object):
             layer[np.isnan(layer)] = layer_interpolated[np.isnan(layer)]
             self.background[...,i] = layer
 
-            self.imshowthis(layer, label=f"background_interp_{layername}.png")
+            # self.imshowthis(layer, label=f"background_interp_{layername}.png")  # Debug only
 
     def plot_bounding_areas(self):
         """
