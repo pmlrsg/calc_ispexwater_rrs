@@ -133,23 +133,15 @@ class Ispeximage(object):
         self.Qp_stacked_RGB_mean = None     # Qx RGB values averaged along the slit dimension
         self.Qm_stacked_RGB_mean = None     #
 
-        # determine where calibration files should be saved (if mode is calibration) or retrieved
-        self.calibration_set = calibration_set                 # Path to the preferred calibration file set, if provided
+        # Determine where calibration files should be saved (if mode is calibration) or retrieved
         self.calibration_root = calibration_root               # Root directory for calibration files
-        if self.calibration_set is None:
-            self.calibration_set = self.find_latest_calibration()   # Find latest calibration set by date for this phone model.
+        self.calibration_set = calibration_set                 # Path to the preferred calibration file set, if provided
         if self.type == 'fluorescent_lamp_cal':
             # calibration coefficients will be stored later
             self.wl_calib_qp = None
             self.wl_calib_qm = None
-        elif self.type == 'observation' and self.calibration_set is not None:
-            # load wavelength calibration coefficients from the latest calibration set
-            # FIXME: there may be multiple calibration sets in the folder - need a way to select the best one e.g. by looking at dispersion..
-            # workaround is to make a folder with a later date label and copy just one set into it.  
-            self.wl_calib_qp = np.load(os.path.join(self.calibration_set, "wavelength_calibration_Qp.npy"))
-            self.wl_calib_qm = np.load(os.path.join(self.calibration_set, "wavelength_calibration_Qm.npy"))
-        else:
-            raise IOError(f"Required calibration files not found")
+        elif self.type == 'observation':
+            self.wl_calib_qp, self.wl_calib_qm = self.find_latest_calibration(self.calibration_set)
 
     def get_datetime_uuid_exposure(self):
         """
@@ -167,44 +159,53 @@ class Ispeximage(object):
         exposure = match.groupdict()['exposure_seq']  # E0, E1, E2, E3, or E4
         return f"{datestr}_{timestr}_{uuid}_{exposure}", match
         
-
-    def find_latest_calibration(self):
+    def find_latest_calibration(self, calibration_set_path=None):
         """
         Return the latest calibration coefficients for the camera.
         Generate a folder for cal files if the device is new to us.
         """
-        cal_path = os.path.join(self.calibration_root, self.dev_model_sanitised)
-        if not os.path.exists(cal_path):
-            os.makedirs(cal_path)
+        if calibration_set_path is None:
+            # where should the calibration files be located based on the device model?
+            cal_path = os.path.join(self.calibration_root, self.dev_model_sanitised)
+            if not os.path.exists(cal_path):
+                os.makedirs(cal_path)
 
-        # Find the latest calibration set (a folder possibly containing multiple calibration images with various exposures)
-        # Assuming calibration sets are named with a date format like 'YYYYMMDD_HHMM_UUID'
-        cal_sets = [folder for folder in glob.glob(os.path.join(cal_path, '*')) if os.path.isdir(folder)]
-        if not cal_sets:
-            self.log.info(f"No calibration sets found for {self.device_model} in {cal_path}.")
-            return None
+            # Find the latest calibration set (a folder possibly containing multiple calibration images with various exposures)
+            # Assuming calibration sets are named with a date format like 'YYYYMMDD_HHMM_UUID'
+            cal_sets = [folder for folder in glob.glob(os.path.join(cal_path, '*')) if os.path.isdir(folder)]
+            if not cal_sets:
+                self.log.info(f"No calibration sets found for {self.device_model} in {cal_path}.")
+                return None
 
-        pattern = re.compile(r"(?P<datestr>\d{8})_(?P<timestr>\d{4})_(?P<uuid>\d{4})")
-        caltimes = []
-        for cal_set in cal_sets:
-            match = pattern.match(os.path.basename(cal_set))
-            if match is None:
-                caltimes.append(-1)
-                continue
-            date = int(match.groupdict()['datestr'])  # Date in YYYYMMDD format
-            time = int(match.groupdict()['timestr'])  # Time in HHMM format
-            uuid = int(match.groupdict()['uuid'])     # UUID
-            caltimes.append(f"%Y%m%d%H%M")
+            pattern = re.compile(r"(?P<datestr>\d{8})_(?P<timestr>\d{4})_(?P<uuid>\d{4})")
+            caltimes = []
+            for cal_set in cal_sets:
+                match = pattern.match(os.path.basename(cal_set))
+                if match is None:
+                    caltimes.append(-1)
+                    continue
+                date = int(match.groupdict()['datestr'])  # Date in YYYYMMDD format
+                time = int(match.groupdict()['timestr'])  # Time in HHMM format
+                uuid = int(match.groupdict()['uuid'])     # UUID
+                caltimes.append(f"%Y%m%d%H%M")
 
-        latest_calibration_set_path = cal_sets[np.argmax(caltimes)][0]
+            calibration_set_path = cal_sets[np.argmax(caltimes)][0]
 
-        if latest_calibration_set_path == -1:
-            if self.type == 'observation':
-                raise FileNotFoundError(f"No calibration sets found for {self.device_model} in {cal_path}. Unable to process iSPEX image.")
-            return None
+            if calibration_set_path == -1:
+                if self.type == 'observation':
+                    raise FileNotFoundError(f"No calibration sets found for {self.device_model} in {cal_path}. Unable to process iSPEX image.")
+                return None
 
-        return latest_calibration_set_path
+        # load wavelength calibration coefficients from the specified calibration path
+        wl_calibs_qp = glob.glob(os.path.join(self.calibration_set_path, "*wavelength_calibration_Qp.npy"))
+        wl_calibs_qm = glob.glob(os.path.join(self.calibration_set_path, "*wavelength_calibration_Qm.npy"))
+        if (len(wl_calibs_qp) != 0) or (len(wl_calibs_qm) != 0):
+            raise FileNotFoundError(f"Calibration could not be determined - too many options in: {cal_set}")
+        self.wl_calib_qp = np.load(wl_calibs_qp[0])
+        self.wl_calib_qm = np.load(wl_calibs_qm[0])
 
+        return self.wl_calib_qp, self.wl_calib_qm
+    
     def process(self):
         """
         Process the image file in memory.
@@ -509,10 +510,9 @@ class Ispeximage(object):
                 overexposed = True
 
             if overexposed and n_clusters == 2:
-                breakpoint()
                 self.log.error("Image is overexposed")
                 self.check_areas = False
-                return
+                raise ValueError("Image is overexposed, cannot process further.")
             elif overexposed:
                 self.log.info(f"Lowering sensitivity from {n_clusters} to {n_clusters - 1} clusters") 
             continue
