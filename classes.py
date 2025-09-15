@@ -123,7 +123,8 @@ class Ispeximage(object):
         self.Qm_background_corrected = None # Qx raw data block, background corrected
         self.Qp_background_corrected = None # 
         self.background = None              # Background noise level interpolation, in brightness units
-
+        self.background_uncertainty_qm = None  # Uncertainty in background correction, in brightness units (2 sigma)
+        self.background_uncertainty_relative_qp = None # Uncertainty in background correction, relative to signal level (2 sigma, %)
         self.wavelengths_split_Qp = None    # Wavelength mapped to each pixel in the sliced Qx 4d array
         self.wavelengths_split_Qm = None    #
 
@@ -197,10 +198,12 @@ class Ispeximage(object):
                 return None
 
         # load wavelength calibration coefficients from the specified calibration path
-        wl_calibs_qp = glob.glob(os.path.join(self.calibration_set_path, "*wavelength_calibration_Qp.npy"))
-        wl_calibs_qm = glob.glob(os.path.join(self.calibration_set_path, "*wavelength_calibration_Qm.npy"))
-        if (len(wl_calibs_qp) != 0) or (len(wl_calibs_qm) != 0):
-            raise FileNotFoundError(f"Calibration could not be determined - too many options in: {cal_set}")
+        wl_calibs_qp = glob.glob(os.path.join(calibration_set_path, "*wavelength_calibration_Qp.npy"))
+        wl_calibs_qm = glob.glob(os.path.join(calibration_set_path, "*wavelength_calibration_Qm.npy"))
+        if (len(wl_calibs_qp) == 0) or (len(wl_calibs_qm) == 0):
+            raise FileNotFoundError(f"Wavelength calibration - missing record in: {calibration_set_path}")
+        if (len(wl_calibs_qp) != 1) or (len(wl_calibs_qm) != 1):
+            raise FileNotFoundError(f"Wavelength Calibration - too many records in: {calibration_set_path}")
         self.wl_calib_qp = np.load(wl_calibs_qp[0])
         self.wl_calib_qm = np.load(wl_calibs_qm[0])
 
@@ -211,8 +214,8 @@ class Ispeximage(object):
         Process the image file in memory.
         Optionally write out plots.
         """
-        self.log = logging.getLogger('ispex.image.process')
-        self.log.info(f"Reading image {self.label}")
+        log = logging.getLogger('ispex.image.process')
+        log.info(f"Reading image {self.label}")
         # read the raw image
         with rawpy_lib.imread(self.dng_path) as img:
             # Ensure image type is as expected (RawType.Flat)
@@ -245,15 +248,14 @@ class Ispeximage(object):
 
         # self.imshowthis(self.img_raw_RGB, label='img_raw_RGB.png')  # Debug only
 
-        self.log.info(f"Identify slit and projected image areas")
+        log.info(f"Identify slit and projected image areas")
         self.find_areas()
         if not self.check_areas:
-            self.log.error("Could not process image (projected areas are invalid)")
+            log.error("Could not process image (projected areas are invalid)")
             raise(Exception("Could not process image (projected areas are invalid)"))
 
         # Background correction
-        self.log.info(f"Interpolate background brightness")
-        # FIXME: do this on RGB instead of RGBG to save time
+        log.info(f"Interpolate background brightness")
         self.background_solver()
         self.img_bg_corrected = self.img_raw_RGB - self.background
 
@@ -262,90 +264,42 @@ class Ispeximage(object):
             self.process_fluorescent_lamp_calibration()
 
         elif self.type == 'observation':
-            #self.process_single_observation()
-            self.log.info("stop here for now")
+            self.process_single_observation()
+
         else:
-            self.log.error(f"Invalid record type: {self.type}")
+            log.error(f"Invalid record type: {self.type}")
 
     def process_single_observation(self):
         """
-        Using aailable calibration information, 
+        Using available calibration information, 
         - calculate the wavelength for each pixel in the image
         - compute radiances
         """
-        self.log = logging.getLogger('ispex.image.process.single')
-        self.log.info(f"Processing iSPEX 2 image")
-        # OLD CODE
-        # raw and demosaicked image have the short axis (along-slit) mirrored for some reason. x-y order also swapped.
-        slice_Qp = np.s_[650:1400]
-        slice_Qm = np.s_[1550:2300]
-        data_Qp, data_Qm = self.img_raw[slice_Qp], self.img_raw[slice_Qm]
-        bayer_Qp, bayer_Qm = self.bayer_map[slice_Qp], self.bayer_map[slice_Qm]
-        x = np.arange(data_Qp.shape[1])                                 #  (4032,)
-        xp = np.repeat(x[:,np.newaxis], bayer_Qp.shape[0], axis=1).T    #  (750, 4032) (width of Q slice, length of image)
-        xm = np.repeat(x[:,np.newaxis], bayer_Qm.shape[0], axis=1).T    #  (750, 4032) (width of Q slice, length of image)
-        yp = np.arange(data_Qp.shape[0])                                #  (750,)
-        ym = np.arange(data_Qm.shape[0])                                #  (750,)
-        #wavelengths_Qp = self.calculate_wavelengths(self.wl_calib_qp, x, yp)
-        #wavelengths_Qm = self.calculate_wavelengths(self.wl_calib_qm, x, ym)
-        coeff_fit = np.array([np.polyval(c, yp) for c in self.wl_calib_qp]).T       # (750,3)
-        wavelengths_Qp = np.array([np.polyval(c_fit, x) for c_fit in coeff_fit])    # (750, 4032) ranging -954.2 to 787.616 in first row, -22147.98 to -2328.61 in last row
-        coeff_fit = np.array([np.polyval(c, ym) for c in self.wl_calib_qm]).T       # (750,3)
-        wavelengths_Qm = np.array([np.polyval(c_fit, x) for c_fit in coeff_fit])    # (750, 4032) ranging -536.9 to 850.7 in first row, -975.2 to 731.5 in last row
-        
+        log = logging.getLogger('ispex.image.process.single')
+        log.info(f"Processing iSPEX 2 image")
+
         # updated code
-        bayer_Qp = self.bayer_map[np.s_[self.start_qp:self.end_qp]][:,::2]               #  (373, 2016)
-        bayer_Qm = self.bayer_map[np.s_[self.start_qm:self.end_qm]][:,::2]               #  (393, 2016)
-        x = np.arange(self.img_raw_RGBG.shape[2])                                   #  (2016,)
-        xp = np.repeat(x[:,np.newaxis], bayer_Qp.shape[0], axis=1).T                #  (373, 2016) (width of Q slice, length of image)
-        xm = np.repeat(x[:,np.newaxis], bayer_Qm.shape[0], axis=1).T                #  (393, 2016) (width of Q slice, length of image)
-        yp = np.arange(self.end_qp-self.start_qp)                                   #  (373,)
-        ym = np.arange(self.end_qm-self.start_qm)                                   #  (393,)
-        coeff_fit = np.array([np.polyval(c, yp) for c in self.wl_calib_qp]).T       #  (373,3)
-        wavelengths_Qp = np.array([np.polyval(c_fit, x) for c_fit in coeff_fit])    #  (373, 2016) ranging -954.2 to 787.616 in first row, -22147.98 to -2328.61 in last row
-        coeff_fit = np.array([np.polyval(c, ym) for c in self.wl_calib_qm]).T       #  (393,3)
-        wavelengths_Qm = np.array([np.polyval(c_fit, x) for c_fit in coeff_fit])    #  (750, 2016) ranging -536.9 to 850.7 in first row, -975.2 to 731.5 in last row
+        bayer_Qp = self.bayer_map[np.s_[self.start_qp:self.end_qp]][:,::2]               #  (along-slit, along-spectrum)
+        bayer_Qm = self.bayer_map[np.s_[self.start_qm:self.end_qm]][:,::2]               #  
+        x = np.arange(self.img_raw_RGBG.shape[2])                                   #  (along-spectrum length of image)
+        xp = np.repeat(x[:,np.newaxis], bayer_Qp.shape[0], axis=1).T                #  (width of Q slice along-slit, length of image)
+        xm = np.repeat(x[:,np.newaxis], bayer_Qm.shape[0], axis=1).T                #  
+        yp = np.arange(self.end_qp-self.start_qp)                                   #  (width of Q slice along-slit,)
+        ym = np.arange(self.end_qm-self.start_qm)                                   #  
+        coeff_fit = np.array([np.polyval(c, yp) for c in self.wl_calib_qp]).T       #  (width of Q slice along-slit, 3)
+        wavelengths_qp = np.array([np.polyval(c_fit, x) for c_fit in coeff_fit])    #  (width of Q slice along-slit, length of image)
+        coeff_fit = np.array([np.polyval(c, ym) for c in self.wl_calib_qm]).T       #  
+        wavelengths_qm = np.array([np.polyval(c_fit, x) for c_fit in coeff_fit])    #  
 
-        wavelengths_RGBG_Qp = self.demosaick(bayer_Qp, wavelengths_Qp)
-        wavelengths_RGBG_Qp = self.demosaick(bayer_Qp, wavelengths_Qm)
-        
-        #wavelengths_split_Qp, RGBG_Qp, xp_split = self.demosaick(bayer_Qp, [wavelengths_Qp, data_Qp, xp])  # wavelengths, RGBQ_Qx split: (4, 375, 2016)
-        #wavelengths_split_Qm, RGBG_Qm, xm_split = self.demosaick(bayer_Qm, [wavelengths_Qm, data_Qm, xm]) 
-        
-        # Updated code
-        # Map pixels to wavelength grid
-        buffer = 0.10  #  % buffer along the slit dimension to avoid edge effects
-        x = np.arange(self.img_bg_corrected.shape[2])                           #  along-spectrum axis length (shorter to longer wavelength), same for Qp and Qm
-        xp = np.repeat(x[:,np.newaxis], self.end_qm - self.start_qm, axis=1).T  #  along-spectrum axis repeated for each line in Qp
-        xm = np.repeat(x[:,np.newaxis], self.end_qp - self.start_qp, axis=1).T  #  along-spectrum axis repeated for each line in Qm
-        yp = np.arange(self.end_qp - self.start_qp)  # along-slit axis of length of Qp section
-        ym = np.arange(self.end_qm - self.start_qm)  # along-slit axis of length of Qm section
-        # apply the polynomial fit of the wavelength calibration to the pixel coordinates
-        coeff_fit = np.array([np.polyval(c, yp) for c in self.wl_calib_qp]).T
-        wavelengths_Qp = np.array([np.polyval(c_fit, x) for c_fit in coeff_fit])
-        coeff_fit = np.array([np.polyval(c, ym) for c in self.wl_calib_qm]).T
-        wavelengths_Qm = np.array([np.polyval(c_fit, x) for c_fit in coeff_fit])
+        # Interpolate to a regular wavelength grid 
+        # Bin pixels in wavelength space to a regular grid
 
-        # Demosaick using the bayer map (mapping pixels to RGBG colours)
-        # - wavelengths_split_Qx are the wavelength mapping for each pixel in the Qx image, 
-        #   correcting for the encoded smile effect.
-        # - RGBG_Qx are the RGBG values for each pixel in the Qx image
-        self.wavelengths_split_Qp, self.RGBG_Qp, xp_split = self.demosaick(bayer_Qp, [wavelengths_Qp, self.Qp_background_corrected, xp])
-        self.wavelengths_split_Qm, self.RGBG_Qm, xm_split = self.demosaick(bayer_Qm, [wavelengths_Qm, self.Qm_background_corrected, xm])
+        # lambdarange = resultant wavelength grid
+        self.wavelength_grid, self.img_calibrated_qp = self.interpolate_multi(wavelengths_qp, self.img_bg_corrected[self.start_qp:self.end_qp, ::])
+        self.wavelength_grid, self.img_calibrated_qm = self.interpolate_multi(wavelengths_qm, self.img_bg_corrected[self.start_qm:self.end_qm, ::])
 
-        # smoothing using a gaussian kernel along the spectral dimension
-        self.RGBG_Qp_smoothed = self._gauss_nan(self.RGBG_Qp, sigma=(0,0,3))  # sigma axes: RGBG channel, along-slit, along-spectrum
-        self.RGBG_Qm_smoothed = self._gauss_nan(self.RGBG_Qm, sigma=(0,0,3))
-
-        # Through interpolation, translate 1 pixel in RGBG space to 2 pixels in RGB space
-        # # lambdarange = resultant wavelength grid
-        # all_interpolated_Qp = interpolated spectra for each line in Qp/Qm image slice
-        lambdarange, Qp_RGBG = self.interpolate_multi(self.wavelengths_split_Qp, self.RGBG_Qp_smoothed)
-        lambdarange, Qm_RGBG = self.interpolate_multi(self.wavelengths_split_Qm, self.RGBG_Qm_smoothed)
-        
-        # stack the RGBG into a WL,R,G,B spectra (4xN) 
-        self.Qp_stacked_RGB = self.stack(lambdarange, Qp_RGBG)  # RGB radiance in arbitrary units
-        self.Qm_stacked_RGB = self.stack(lambdarange, Qm_RGBG)  # RGB radiance in arbitrary units
+        self.spectra_calibrated_qp = self.stack(self.wavelength_grid, self.img_calibrated_qp)  # RGB radiance in arbitrary units
+        self.spectra_calibrated_qm = self.stack(self.wavelength_grid, self.img_calibrated_qm)  # RGB radiance in arbitrary units
 
     def process_fluorescent_lamp_calibration(self):
         """
@@ -643,8 +597,16 @@ class Ispeximage(object):
             layer_original_qp = self.img_raw_RGB[int(self.start_qp):int(self.end_qp), int(self.top_qx):int(self.bottom_qx), i]
             layer_interp_qx = np.concat([layer_interp_qm, layer_interp_qp], axis=0)
             layer_original_qx = np.concat([layer_original_qm, layer_original_qp], axis=0)
-            uncertainty_background_2sigma[layername] = np.nanstd(layer_interp_qx - layer_original_qx) * 2.0
-            self.log.info(f"Uncertainty background 2 sigma for layer {i}: {uncertainty_background_2sigma[layername]}")
+
+            # define the uncertainty as 2x the standard deviation of the difference between original and interpolated values
+            self.background_uncertainty_qp = np.nanstd(layer_interp_qx - layer_original_qx) * 2.0
+            self.background_uncertainty_qm = np.nanstd(layer_interp_qm - layer_original_qm) * 2.0
+            self.background_uncertainty_relative_qp = ((np.nanstd(layer_interp_qx - layer_original_qx))/np.nanmean(layer_original_qx)) * 200.0
+            self.background_uncertainty_relative_qm = ((np.nanstd(layer_interp_qm - layer_original_qm))/np.nanmean(layer_original_qm)) * 200.0
+            self.log.info(f"Uncertainty background 2 sigma for layer {i} qp:\
+                           {self.background_uncertainty_qp} ({self.background_uncertainty_relative_qp:2.2f} %)")
+            self.log.info(f"Uncertainty background 2 sigma for layer {i} qm:\
+                           {self.background_uncertainty_qm} ({self.background_uncertainty_relative_qm:2.2f} %)")
 
             # Replace the NaN values in the original background_slice with the interpolated values
             layer[np.isnan(layer)] = layer_interpolated[np.isnan(layer)]
@@ -707,42 +669,15 @@ class Ispeximage(object):
         """
         Plot radiance spectra in arbitrary units
         """
-        # Qp stack
-        plt.figure(figsize=(6,2))
-        for j, c in enumerate("rgb", 1):
-            plt.plot(self.Qp_stacked_RGB[0], self.Qp_stacked_RGB[j], c=c)
-        plt.xlabel("Wavelength [nm]")
-        plt.ylabel("Radiance [a.u.]")
-        plt.grid(ls="--")
-        plt.ylim(-5, np.nanmax(self.Qp_stacked_RGB[1:])*1.05)
-        plt.xlim(390, 700)
-
-        if self.output_plots:
-            plt.savefig(os.path.join(self.save_path, f"{self.label}_Qp.png"), dpi=300, bbox_inches="tight")
-        plt.close()
-
-        # Qm stack
-        plt.figure(figsize=(6,2))
-        for j, c in enumerate("rgb", 1):
-            plt.plot(self.Qm_stacked_RGB[0], self.Qm_stacked_RGB[j], c=c)
-        plt.xlabel("Wavelength [nm]")
-        plt.ylabel("Radiance [a.u.]")
-        plt.grid(ls="--")
-        plt.ylim(-5, np.nanmax(self.Qm_stacked_RGB[1:])*1.05)
-        plt.xlim(390, 700)
-        if self.output_plots:
-            plt.savefig(os.path.join(self.save_path, f"{self.label}_Qm.png"), dpi=300, bbox_inches="tight")
-        plt.close()
-
         # Spectrum plot
         plt.rcParams.update({'font.size': 14, 'axes.labelsize': 14})
         plt.figure(figsize=(10, 4))  # Wider figure
 
         # Use a loop to plot each spectrum with a thicker line for visibility
         for j, color in zip(range(1, 4), ['red', 'green', 'blue']):  # Explicit color names for clarity
-            plt.plot(self.Qp_stacked_RGB[0], self.Qp_stacked_RGB[j]+self.Qm_stacked_RGB[j], c=color, linewidth=2)  # Thicker lines
-            plt.plot(self.Qp_stacked_RGB[0], self.Qp_stacked_RGB[j], c=color, linewidth=2, linestyle='--')  # Thicker lines
-            plt.plot(self.Qm_stacked_RGB[0], self.Qm_stacked_RGB[j], c=color, linewidth=2, linestyle=':')  # Thicker lines
+            plt.plot(self.spectra_calibrated_qp[:,0], self.spectra_calibrated_qp[:,j]+self.spectra_calibrated_qm[:,j], c=color, linewidth=2)  # Thicker lines
+            plt.plot(self.spectra_calibrated_qm[:,0], self.spectra_calibrated_qm[:,j], c=color, linewidth=2, linestyle='--')  # Thicker lines
+            plt.plot(self.spectra_calibrated_qp[:,0], self.spectra_calibrated_qp[:,j], c=color, linewidth=2, linestyle=':')  # Thicker lines
 
         plt.legend(["Red", "Green", "Blue",
                     "Red_Qm", "Green_Qm", "Blue_Qm",
@@ -750,11 +685,11 @@ class Ispeximage(object):
         plt.xlabel("Wavelength [nm]", fontsize=14, fontweight='bold')
         plt.ylabel("Intensity [a.u.]", fontsize=14, fontweight='bold')
         plt.grid(color='grey', linestyle='--', linewidth=0.5, alpha=0.7)
-        plt.ylim(0, np.nanmax(self.Qp_stacked_RGB[1:]+self.Qm_stacked_RGB[1:])*1.1)  # 10% more space above the max value
-        plt.xlim(390, 700)
-
-        if self.output_plots:
-            plt.savefig(os.path.join(self.save_path, f"{self.label}_spectrum.png"), bbox_inches="tight", dpi=300)
+        qpmax = np.nanmax(self.spectra_calibrated_qp[:,1:])
+        qmmax = np.nanmax(self.spectra_calibrated_qm[:,1:])
+        plt.ylim(0, 1.1*(qpmax+qmmax))  # 10% more space above the max value
+        plt.xlim(350, 700)
+        plt.savefig(os.path.join(self.save_path, f"{self.label}_spectrum.png"), bbox_inches="tight", dpi=300)
         plt.close()
 
     def plot_fluorescent_lines(self, y, lines, lines_fit, qx):
@@ -947,25 +882,24 @@ class Ispeximage(object):
 
         return RGBG
     
-    def interpolate(self, wavelength_array, color_value_array, lambdarange):
-        interpolated = np.array([np.interp(lambdarange, wavelengths, color_values) for wavelengths, color_values in zip(wavelength_array, color_value_array)])
-        return interpolated
-
-    def interpolate_multi(self, wavelengths_split, RGBG, lambdamin=390, lambdamax=700, lambdastep=1):
+    def interpolate_multi(self, wavelengths_split, RGB, lambdamin=350, lambdamax=750, lambdastep=1):
         lambdarange = np.arange(lambdamin, lambdamax+lambdastep, lambdastep)
-        all_interpolated = np.array([self.interpolate(wavelengths_split[c], RGBG[c], lambdarange) for c in range(4)])
-        all_interpolated = np.moveaxis(all_interpolated, 2, 1)
-        return lambdarange, all_interpolated
+        n_bands = self.img_bg_corrected.shape[-1]
+        interpolated = np.zeros((RGB.shape[0], lambdarange.shape[0], n_bands))
+        for b in range(n_bands):
+            interpolated[:,:,b] = [np.interp(lambdarange, wl, vals) for wl, vals in zip(wavelengths_split[:,:], RGB[:,:,b])]
+
+        #all_interpolated = np.moveaxis(all_interpolated, 2, 1)
+        #return lambdarange, all_interpolated
+        return lambdarange, interpolated
 
     def stack(self, wavelengths, interpolated):
         """
-        Combine two Green channels and add wavelength grid
+        Convert wavelength-calibrated grids to RGB radiance spectra
         Outputs [WL, R, G, B] array
         """
-        stacked = interpolated.mean(axis=2)
-        stacked = np.roll(stacked, 1, axis=0)      # move to make space for wavelengths
-        stacked[2] = (stacked[0] + stacked[2])/2.  # G becomes mean of G
-        stacked[0] = wavelengths  # put wavelengths into array
+        stacked = interpolated.mean(axis=0)
+        stacked = np.vstack([wavelengths, stacked.T]).T
         return stacked
     
     def _find_cal_peaks(self, data: np.ndarray, threshold: float) -> list[int]:

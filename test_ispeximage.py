@@ -10,6 +10,10 @@ log = logging.getLogger('ispex')
 
 # where are the images stored
 img_path = os.path.abspath("example_data/iSPEX_Set_20250806_0925_3537")
+save_path = os.path.abspath(os.path.join("example_outputs", os.path.basename(img_path)))
+
+if not os.path.isdir(save_path):
+    os.makedirs(save_path)
 
 # find all the images
 if not os.path.exists(img_path):
@@ -32,22 +36,24 @@ for impath in images:
     match = pattern.match(os.path.basename(impath))
     if match is None:
         raise ValueError(f"Filename {os.path.basename(impath)} does not match expected pattern.")
+
     obstype = match.groupdict()['obstype']  # 'C', 'S', or 'W' for Card, Sky, Water
     exposure = match.groupdict()['exposure_seq']  # E0, E1, E2, E3, or E4
+    # below, we override the cal set lookup (pick E2) until we have a way to select the best exposure
     if obstype == 'C':
         card_set[exposure] = Ispeximage(dng_path=impath,
                                         type='observation',
-                                        save_path_root='example_data/iSPEX_Set_20250806_0925_3537',
+                                        save_path_root='example_outputs/iSPEX_Set_20250806_0925_3537',
                                         calibration_set='cameras/iPhone14_4/20250813_1501_59E5_E2')
     elif obstype == 'W':
         water_set[exposure] = Ispeximage(dng_path=impath,
-                                         type='osbservation',
-                                         save_path_root='example_data/iSPEX_Set_20250806_0925_3537',
+                                         type='observation',
+                                         save_path_root='example_outputs/iSPEX_Set_20250806_0925_3537',
                                         calibration_set='cameras/iPhone14_4/20250813_1501_59E5_E2')
     elif obstype == 'S':
         sky_set[exposure] = Ispeximage(dng_path=impath,
                                        type='observation',
-                                       save_path_root='example_data/iSPEX_Set_20250806_0925_3537',
+                                       save_path_root='example_outputs/iSPEX_Set_20250806_0925_3537',
                                         calibration_set='cameras/iPhone14_4/20250813_1501_59E5_E2')
     else:
         log.warning(f"Unknown observation type {obstype} in file {impath}")
@@ -63,10 +69,12 @@ for set in [card_set, water_set, sky_set]:
                 set[exposure].process()
                 set[exposure].plot_bounding_areas()
                 #set[exposure].plot_background_correction()
-                #set[exposure].plot_spectra()
+                set[exposure].plot_spectra()
             except Exception as e:
                 log.error(f"Error processing {set[exposure].dng_path}: {e}")
                 continue
 
+breakpoint()
 
 # quality control - which image exposures should be used for Rrs
+# Produce Rrs (using new class in classes.py)
